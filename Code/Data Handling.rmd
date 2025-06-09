@@ -1,0 +1,221 @@
+---
+title: "Advanced IV Methods Data Handling"
+date: "08/06/2025"
+output: pdf_document
+---
+
+```{r load, include = F}
+list.of.packages <- c("tidyverse", "haven", "knitr", "broom", "stargazer", "weights")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos = "http://cran.us.r-project.org")
+
+invisible(lapply(list.of.packages, library, character.only = TRUE))
+
+# load packages
+library("tidyverse")
+library("haven")
+library("kableExtra")
+```
+
+# Read in relevant data sources
+
+```{r data}
+# read in 1/5% level adjustment factors from Lee et al
+dat05 <- readRDS("./adj_05.rda")
+dat01 <- readRDS("./adj_01.rda")
+
+# read in our assembled dataset
+papers <- read.csv("./papers_dataset.csv") %>% mutate(
+  first_stage_f = as.numeric(gsub(",", "", first_stage_f)),
+  iv_sd = as.numeric(gsub(",", "", iv_sd)),
+  iv_beta = as.numeric(gsub(",", "", iv_beta)),
+  journal = ifelse(grepl("macro", journal, ignore.case = T), "Macroeconomics",
+                   ifelse(grepl("micro", journal, ignore.case = T), "Microeconomics",
+                          ifelse(grepl("applied", journal, ignore.case = T), "Applied Economics", "Economic Policy")))
+) %>% filter(journal != "")
+
+# filter specifications 
+papers_dat <- filter(papers, !is.na(first_stage_f)  &  !is.na(iv_sd)) %>%
+  select(journal, year, title, strategy, first_stage_f, iv_beta, iv_sd, n_authors, n_female, top_uni, topic) %>%
+  mutate(female_author_share = n_female / n_authors,
+         has_female_author = n_female >= 1,
+         topic_aggregate = NA) %>%
+  mutate(n_female_authors = n_female, 
+         n_authors_top_uni = top_uni,
+         .keep = "unused") 
+
+aggregates <- c("Health", "Labor", "Politics", "Tax", "Micro", "Education", "Law", "Macro")
+for (row in 1:nrow(papers_dat)) {
+  topics <- str_split(papers_dat[row, 'topic'], "; ", simplify = T)
+  for (topic in topics) {
+    if (topic %in% aggregates) {
+      papers_dat[row,]['topic_aggregate'] <- topic
+      break
+    }
+  }
+}
+papers_dat <- subset(papers_dat, select = -topic)
+```
+
+```{r tfse}
+adj_factor_index <- function(fstat, adj_dat) {
+  return(findInterval(fstat, adj_dat$f))
+}
+
+# return adjusted SE
+tf_se <- function(fstat, adj_dat) {
+  if (fstat <= min(adj_dat$f)) {
+    adj_factor <- max(adj_dat$adj)
+  } else if (fstat >= max(adj_dat$f)) {
+    adj_factor <- min(adj_dat$adj)
+  } else {
+    index <- adj_factor_index(fstat, adj_dat)
+    if (adj_dat$f[index] == fstat) {
+      adj_factor <- adj_dat$adj[index]
+    } else {
+      adj_factor <- adj_dat$adj[index+1] + 
+        (adj_dat$f[index+1] - fstat)/(adj_dat$f[index+1] - adj_dat$f[index]) *
+        (adj_dat$adj[index] - adj_dat$adj[index+1])
+    }
+  }
+  return(adj_factor)
+}
+
+stopifnot(abs(tf_se(10, dat05) - 1.751) < 10e-3)
+```
+
+```{r }
+# for every spec, get adjusted SE at 0.01/0.05 level
+papers_dat$tfse_05 <- NA
+papers_dat$tfse_01 <- NA
+papers_dat$adj_factor_05 <- NA
+papers_dat$adj_factor_01 <- NA
+for (row in 1:nrow(papers_dat)) {
+  adj_factor_05 <- tf_se(papers_dat[row, 'first_stage_f'], dat05)
+  adj_factor_01 <- tf_se(papers_dat[row, 'first_stage_f'], dat01)
+  tf_05 <- papers_dat[row, 'iv_sd'] * adj_factor_05
+  tf_01 <- papers_dat[row, 'iv_sd'] * adj_factor_01
+  papers_dat[row, 'tfse_05'] <- tf_05
+  papers_dat[row, 'tfse_01'] <- tf_01
+  papers_dat[row, 'adj_factor_05'] <- adj_factor_05
+  papers_dat[row, 'adj_factor_01'] <- adj_factor_01
+}
+```
+
+```{r }
+z05 <- 1.96
+z01 <- 2.576
+
+papers_dat <- papers_dat %>% mutate(
+  CI05_includes_0 = iv_beta - z05*iv_sd <= 0 & iv_beta + z05*iv_sd >= 0,
+  CI01_includes_0 = iv_beta - z01*iv_sd <= 0 & iv_beta + z01*iv_sd >= 0,
+  tfCI05_includes_0 = iv_beta - z05*tfse_05 <= 0 & iv_beta + z05*tfse_05 >= 0,
+  tfCI01_includes_0 = iv_beta - z01*tfse_01 <= 0 & iv_beta + z01*tfse_01 >= 0,
+  f_over_10 = first_stage_f >= 10,
+  t = iv_beta / iv_sd,
+  t05 = abs(t) >= z05)
+
+# Add weight
+papers_titles <- papers_dat %>% 
+  group_by(title) %>% 
+  summarise(specifications = n(),
+            share = n()/nrow(papers_dat)) %>% 
+  mutate(weight = 1/specifications)
+papers_dat <- left_join(papers_dat, papers_titles, by = "title")
+```
+
+
+# Graph 3: figure 6 in Lee et al (2021):
+
+```{r }
+fnorm <- function(f) return((f/10) / (1 + f/10))
+tnorm <- function(t) return((t/z05)^2 / (1 + (t/z05)^2))
+
+dat <- papers_dat %>% 
+   select(first_stage_f, iv_beta, iv_sd, c(14:24, 27)) %>%
+  mutate(f_norm = fnorm(first_stage_f),
+         t_norm = tnorm(t),
+         sig = 0)
+
+### smoothed tf-function
+dat05 <- dat05 %>%
+  mutate(minimum_t = z05 * adj,
+         f_norm = fnorm(f)) %>%
+  mutate(t_norm = tnorm(minimum_t))
+
+dat01 <- dat01 %>%
+  mutate(minimum_t = z01 * adj, 
+         f_norm = fnorm(f)) %>%
+  mutate(t_norm = tnorm(minimum_t))
+
+x_vals <- fnorm(c(1.96^2, 2.58^2, 10, 104.7))
+y_vals <- tnorm(c(1.96, 2.73))
+
+dat <- dat %>% mutate(
+  sig = ifelse(f_over_10 & t05 & CI05_includes_0 == F,
+               ifelse(tfCI05_includes_0 == F, 
+                      ifelse(tfCI01_includes_0 == F, 3, 2), 1), 0))
+
+plt <- ggplot() +
+  geom_vline(aes(xintercept = x_vals[1]), color = "grey", linetype = "dashed") + 
+  geom_vline(aes(xintercept = x_vals[2]), color = "grey", linetype = "dashed") + 
+  geom_vline(aes(xintercept = x_vals[3]), color = "grey", linetype = "dashed") + 
+  geom_vline(aes(xintercept = x_vals[4]), color = "grey", linetype = "dashed") +
+  geom_hline(aes(yintercept = y_vals[1]), color = "grey", linetype = "dashed") + 
+  geom_hline(aes(yintercept = y_vals[2]), color = "grey", linetype = "dashed") + 
+  geom_point(data = dat, 
+             aes(x = f_norm, y = t_norm, color = as.factor(sig), size = weight), 
+             shape = 1, stroke = 0.8) + 
+  scale_color_manual(values = c("black", "blue", "#8B008B", "red")) +
+  geom_smooth(data = dat05, aes(x = f_norm, y = t_norm), color = "black") +
+  geom_segment(aes(x = x_vals[4], xend = 1, y = y_vals[1]+2.5e-3, yend = y_vals[1]+2.5e-3), 
+               color = "black", size = 1) +
+  geom_smooth(data = dat01, aes(x = f_norm, y = t_norm), color = "darkgrey") +
+  geom_segment(aes(x=0.96188, xend = 1, y = y_vals[2]+2.5e-3, yend = y_vals[2]+2.5e-3), 
+               color = "darkgrey", size = 1) +
+  ylab(bquote(t^2~"statistic")) + xlab("F statistic") + 
+  scale_x_continuous(
+    limits = c(-0.05, 1.05), expand = c(0, 0), breaks = c(0, x_vals, 1),  
+    labels = c("0", "1.96^2", "2.58^2", "10","104.6", expression(infinity)))  +
+  scale_y_continuous(
+    limits = c(-0.05, 1.05), expand = c(0, 0), breaks = c(0, y_vals, 1), 
+    labels = c("0", "1.96^2", "2.73^2", expression(infinity))) + 
+  theme_classic() + theme(legend.position = "none")
+
+
+ggsave(filename = "./fig6.png", height = 4, width = 6.92)
+```
+
+```{r regs}
+r1 <- lm(adj_factor_05 ~ journal + strategy + year + female_author_share + has_female_author + topic_aggregate, data = papers_dat)
+summary(r1)
+
+r1 <- lm(adj_factor_05 ~ journal + strategy + year + female_author_share + has_female_author + topic_aggregate, data = papers_dat)
+summary(r1)
+```
+
+```{r journals}
+journal_dat <- papers_dat %>% group_by(journal) %>% summarise(N = n())
+kable(journal_dat, caption = "Data Journal Distribution", 
+      align = c("l", "c"), 
+      col.names = c("AEJ Section", "Count")) %>%
+  save_kable(file = "./journals.png", zoom = 2)
+```
+
+```{r stats}
+# get new significant stats at 0.05 level
+sum(papers_dat$tfCI05_includes_0 == TRUE & papers_dat$CI05_includes_0 == FALSE)
+sum(papers_dat$CI05_includes_0 == FALSE)
+
+# get new significant stats at 0.01 level
+sum(papers_dat$tfCI01_includes_0 == TRUE & papers_dat$CI01_includes_0 == FALSE)
+sum(papers_dat$CI01_includes_0 == FALSE)
+
+nrow(papers_dat)
+
+# => Out of 437 specifications, 262 are significantly different from zero
+# 65 of which (65/262 ~= 25%) are no longer sig. different from zero
+# (at 5% level) after SE adjustment
+```
+
+Out of 437 specifications, 262 are significant (at the 0.05 level), 65 of which ($65/262 \approx 25\%$) are no longer significantly different from zero at 0.05 level after SE adjustment. Similarly, 187 are significant (at the 0.01 level), 56 of which ($56/187 \approx 30\%$) are no longer significantly different from zero at the 0.01 level after adjustment.
